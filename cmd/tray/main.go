@@ -26,11 +26,26 @@ const (
 )
 
 var (
-	modKernel32      = syscall.NewLazyDLL("kernel32.dll")
-	procCreateMutexW = modKernel32.NewProc("CreateMutexW")
+	modKernel32                     = syscall.NewLazyDLL("kernel32.dll")
+	modUser32                       = syscall.NewLazyDLL("user32.dll")
+	procCreateMutexW                = modKernel32.NewProc("CreateMutexW")
+	procSetProcessDpiAwarenessCtx   = modUser32.NewProc("SetProcessDpiAwarenessContext")
+	procSetProcessDPIAware          = modUser32.NewProc("SetProcessDPIAware")
 )
 
 const errorAlreadyExists = syscall.Errno(183)
+
+func enableDPIAwareness() {
+	// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (DPI_AWARENESS_CONTEXT)-4
+	const perMonitorAwareV2 = ^uintptr(3)
+	if procSetProcessDpiAwarenessCtx.Find() == nil {
+		procSetProcessDpiAwarenessCtx.Call(perMonitorAwareV2)
+		return
+	}
+	if procSetProcessDPIAware.Find() == nil {
+		procSetProcessDPIAware.Call()
+	}
+}
 
 func main() {
 	once := flag.Bool("once", false, "Lit un paquet de batterie dans le terminal puis quitte")
@@ -41,6 +56,8 @@ func main() {
 		runCLI(*once)
 		return
 	}
+
+	enableDPIAwareness()
 
 	// Single-instance guard for the tray application.
 	mutex, ok := acquireSingleInstanceMutex()

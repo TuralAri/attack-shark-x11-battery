@@ -11,9 +11,10 @@ func TestRenderAllStates(t *testing.T) {
 		state VisualState
 	}{
 		{"disconnected", -1, VisualDisconnected},
+		{"single_digit_5", 5, VisualDischarging},
 		{"low_15", 15, VisualDischarging},
 		{"medium_35", 35, VisualDischarging},
-		{"high_92", 92, VisualDischarging},
+		{"high_84", 84, VisualDischarging},
 		{"full_100", 100, VisualFull},
 		{"charging_55", 55, VisualCharging},
 		{"sleeping_80", 80, VisualSleeping},

@@ -14,13 +14,17 @@ var (
 
 	procCreateIconIndirect = modUser32.NewProc("CreateIconIndirect")
 	procDestroyIcon        = modUser32.NewProc("DestroyIcon")
+	procGetSystemMetrics   = modUser32.NewProc("GetSystemMetrics")
 
 	procCreateDIBSection = modGdi32.NewProc("CreateDIBSection")
 	procCreateBitmap     = modGdi32.NewProc("CreateBitmap")
 	procDeleteObject     = modGdi32.NewProc("DeleteObject")
 )
 
-const iconSize = 32
+const (
+	baseSize   = 16
+	smCXSmIcon = 49
+)
 
 type bitmapInfoHeader struct {
 	biSize          uint32
@@ -49,7 +53,6 @@ type iconInfo struct {
 	hbmColor uintptr
 }
 
-// RGBA color.
 type rgba struct{ r, g, b, a byte }
 
 // VisualState defines how the tray icon should be rendered.
@@ -68,6 +71,21 @@ func Destroy(hicon uintptr) {
 	if hicon != 0 {
 		procDestroyIcon.Call(hicon)
 	}
+}
+
+// trayIconSize returns the exact native small-icon size for the current DPI
+// (e.g. 16 at 100%, 20 at 125%, 24 at 150%, 32 at 200%) so Windows never
+// applies blurry downscaling.
+func trayIconSize() int {
+	r, _, _ := procGetSystemMetrics.Call(smCXSmIcon)
+	s := int(r)
+	if s < 16 {
+		return 16
+	}
+	if s > 64 {
+		return 64
+	}
+	return s
 }
 
 // IsLightTaskbar detects whether Windows uses the light taskbar theme.
@@ -93,26 +111,37 @@ func IsLightTaskbar() bool {
 	return val == 1
 }
 
-// Render generates a crisp 32x32 Win32 HICON showing the battery percentage and color bar.
+// Render generates a pixel-perfect Win32 HICON at the exact system tray size,
+// showing large bold battery digits and a sleek 2px color bar at the bottom.
 func Render(percentage int, state VisualState) (uintptr, error) {
-	pixels := make([]byte, iconSize*iconSize*4) // BGRA premultiplied
+	base := make([]byte, baseSize*baseSize*4) // 16x16 logical grid, BGRA
 
 	light := IsLightTaskbar()
 	fg := rgba{255, 255, 255, 255}
-	track := rgba{70, 75, 85, 210}
+	track := rgba{72, 78, 88, 220}
 	if light {
-		fg = rgba{24, 28, 36, 255}
-		track = rgba{190, 195, 205, 230}
+		fg = rgba{20, 24, 31, 255}
+		track = rgba{185, 192, 204, 235}
 	}
 
 	barColor := rgba{46, 204, 113, 255} // Green
 	switch state {
 	case VisualDisconnected:
 		barColor = rgba{135, 142, 155, 255}
+		if light {
+			fg = rgba{110, 116, 128, 255}
+		} else {
+			fg = rgba{175, 182, 194, 255}
+		}
 	case VisualSleeping:
 		barColor = rgba{148, 163, 184, 255}
 	case VisualCharging:
 		barColor = rgba{56, 189, 248, 255} // Cyan
+		if light {
+			fg = rgba{2, 132, 199, 255}
+		} else {
+			fg = rgba{125, 211, 252, 255}
+		}
 	case VisualFull:
 		barColor = rgba{34, 197, 94, 255}
 	default:
@@ -123,7 +152,6 @@ func Render(percentage int, state VisualState) (uintptr, error) {
 		}
 	}
 
-	// Text label: "--" if disconnected, otherwise numeric percentage ("0".."100").
 	label := "--"
 	if state != VisualDisconnected && percentage >= 0 {
 		if percentage > 100 {
@@ -132,121 +160,273 @@ func Render(percentage int, state VisualState) (uintptr, error) {
 		label = fmt.Sprintf("%d", percentage)
 	}
 
-	// Draw crisp centered digits in the upper area (y = 2..20).
-	if len(label) == 3 {
-		// Compact 3-digit layout for "100" using 5x7 glyphs scaled 2x vertically / 1.5x-style (8px wide each + 1px gap = 26px).
-		drawTextCompact(pixels, label, 3, 4, fg)
-	} else {
-		// Bold 2x scaled 5x7 font (each char 10x14, gap 2px).
-		charW := 10
-		gap := 2
-		totalW := len(label)*charW + (len(label)-1)*gap
-		startX := (iconSize - totalW) / 2
-		drawTextScaled(pixels, label, startX, 3, 2, fg)
+	// Render bold full-height digits on y = 1..11 (11px tall on 16x16 grid).
+	switch len(label) {
+	case 3:
+		// "100" using crisp 3+1+5+1+5 = 15px layout.
+		draw100(base, 0, 1, fg)
+	case 2:
+		if label == "--" {
+			fillRect(base, baseSize, 1, 5, 6, 2, fg)
+			fillRect(base, baseSize, 9, 5, 6, 2, fg)
+		} else {
+			// Two bold 7x11 digits with a 2px gap -> fills all 16px cleanly!
+			drawGlyph7x11(base, rune(label[0]), 0, 1, fg)
+			drawGlyph7x11(base, rune(label[1]), 9, 1, fg)
+		}
+	case 1:
+		drawGlyph7x11(base, rune(label[0]), 4, 1, fg)
 	}
 
-	// Draw sleek battery bar at the bottom (y = 23..29, x = 2..29).
-	const barX, barY, barW, barH = 2, 23, 28, 6
-	fillRect(pixels, barX, barY, barW, barH, track)
+	// Sleek 2px battery bar at the very bottom (y = 14..15, full 16px width).
+	const barX, barY, barW, barH = 0, 14, 16, 2
+	fillRect(base, baseSize, barX, barY, barW, barH, track)
 
 	if state != VisualDisconnected && percentage >= 0 {
-		fillW := (barW * percentage) / 100
-		if percentage > 0 && fillW < 2 {
-			fillW = 2
+		fillW := (barW*percentage + 50) / 100
+		if percentage > 0 && fillW < 1 {
+			fillW = 1
 		}
 		if fillW > barW {
 			fillW = barW
 		}
-		fillRect(pixels, barX, barY, fillW, barH, barColor)
+		fillRect(base, baseSize, barX, barY, fillW, barH, barColor)
 	}
 
-	// Small charging indicator dot in top-right when charging.
-	if state == VisualCharging {
-		fillRect(pixels, 27, 1, 4, 4, rgba{56, 189, 248, 255})
+	target := trayIconSize()
+	pixels := base
+	if target != baseSize {
+		pixels = scaleNearest(base, baseSize, target)
 	}
 
-	return createIconFromBGRA(pixels, iconSize, iconSize)
+	return createIconFromBGRA(pixels, target, target)
 }
 
-// 5x7 pixel font for digits and '-'.
-var font5x7 = map[rune][7]uint8{
-	'0': {0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110},
-	'1': {0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110},
-	'2': {0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111},
-	'3': {0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110},
-	'4': {0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010},
-	'5': {0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110},
-	'6': {0b01110, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b01110},
-	'7': {0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000},
-	'8': {0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110},
-	'9': {0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100},
-	'-': {0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000},
+// Bold 7x11 pixel-art digits (2px vertical stems, crisp 1px horizontals, rounded corners).
+// Designed specifically for 1:1 legibility at 16x16 native taskbar resolution.
+var font7x11 = map[rune][11]uint8{
+	'0': {
+		0b0111110,
+		0b1100011,
+		0b1100011,
+		0b1100011,
+		0b1100011,
+		0b1100011,
+		0b1100011,
+		0b1100011,
+		0b1100011,
+		0b1100011,
+		0b0111110,
+	},
+	'1': {
+		0b0001100,
+		0b0011100,
+		0b0111100,
+		0b0001100,
+		0b0001100,
+		0b0001100,
+		0b0001100,
+		0b0001100,
+		0b0001100,
+		0b0001100,
+		0b0111110,
+	},
+	'2': {
+		0b0111110,
+		0b1100011,
+		0b0000011,
+		0b0000011,
+		0b0000110,
+		0b0011100,
+		0b0110000,
+		0b1100000,
+		0b1100000,
+		0b1100000,
+		0b1111111,
+	},
+	'3': {
+		0b0111110,
+		0b1100011,
+		0b0000011,
+		0b0000011,
+		0b0000011,
+		0b0011110,
+		0b0000011,
+		0b0000011,
+		0b0000011,
+		0b1100011,
+		0b0111110,
+	},
+	'4': {
+		0b0000110,
+		0b0001110,
+		0b0011110,
+		0b0110110,
+		0b1100110,
+		0b1100110,
+		0b1111111,
+		0b0000110,
+		0b0000110,
+		0b0000110,
+		0b0000110,
+	},
+	'5': {
+		0b1111111,
+		0b1100000,
+		0b1100000,
+		0b1100000,
+		0b1100000,
+		0b1111110,
+		0b0000011,
+		0b0000011,
+		0b0000011,
+		0b1100011,
+		0b0111110,
+	},
+	'6': {
+		0b0111110,
+		0b1100011,
+		0b1100000,
+		0b1100000,
+		0b1100000,
+		0b1111110,
+		0b1100011,
+		0b1100011,
+		0b1100011,
+		0b1100011,
+		0b0111110,
+	},
+	'7': {
+		0b1111111,
+		0b0000011,
+		0b0000011,
+		0b0000110,
+		0b0000110,
+		0b0001100,
+		0b0001100,
+		0b0011000,
+		0b0011000,
+		0b0011000,
+		0b0011000,
+	},
+	'8': {
+		0b0111110,
+		0b1100011,
+		0b1100011,
+		0b1100011,
+		0b1100011,
+		0b0111110,
+		0b1100011,
+		0b1100011,
+		0b1100011,
+		0b1100011,
+		0b0111110,
+	},
+	'9': {
+		0b0111110,
+		0b1100011,
+		0b1100011,
+		0b1100011,
+		0b1100011,
+		0b0111111,
+		0b0000011,
+		0b0000011,
+		0b0000011,
+		0b1100011,
+		0b0111110,
+	},
 }
 
-// Compact 4x7 glyphs for 3-digit "100".
-var font4x7 = map[rune][7]uint8{
-	'1': {0b0100, 0b1100, 0b0100, 0b0100, 0b0100, 0b0100, 0b1110},
-	'0': {0b0110, 0b1001, 0b1001, 0b1001, 0b1001, 0b1001, 0b0110},
+var glyph1Slim = [11]uint8{
+	0b010,
+	0b110,
+	0b010,
+	0b010,
+	0b010,
+	0b010,
+	0b010,
+	0b010,
+	0b010,
+	0b010,
+	0b111,
 }
 
-func drawTextScaled(buf []byte, text string, x, y, scale int, c rgba) {
-	cx := x
-	for _, ch := range text {
-		glyph, ok := font5x7[ch]
-		if !ok {
-			cx += 5*scale + 2
-			continue
-		}
-		for row := 0; row < 7; row++ {
-			bits := glyph[row]
-			for col := 0; col < 5; col++ {
-				if (bits>>(4-col))&1 != 0 {
-					fillRect(buf, cx+col*scale, y+row*scale, scale, scale, c)
-				}
+var glyph0Slim = [11]uint8{
+	0b01110,
+	0b10001,
+	0b10001,
+	0b10001,
+	0b10001,
+	0b10001,
+	0b10001,
+	0b10001,
+	0b10001,
+	0b10001,
+	0b01110,
+}
+
+func drawGlyph7x11(buf []byte, ch rune, x, y int, c rgba) {
+	glyph, ok := font7x11[ch]
+	if !ok {
+		return
+	}
+	for row := 0; row < 11; row++ {
+		bits := glyph[row]
+		for col := 0; col < 7; col++ {
+			if (bits>>(6-col))&1 != 0 {
+				setPixel(buf, baseSize, x+col, y+row, c)
 			}
 		}
-		cx += 5*scale + 2
 	}
 }
 
-func drawTextCompact(buf []byte, text string, x, y int, c rgba) {
-	cx := x
-	for _, ch := range text {
-		glyph, ok := font4x7[ch]
-		if !ok {
-			cx += 9
-			continue
-		}
-		for row := 0; row < 7; row++ {
-			bits := glyph[row]
-			for col := 0; col < 4; col++ {
-				if (bits>>(3-col))&1 != 0 {
-					fillRect(buf, cx+col*2, y+row*2, 2, 2, c)
-				}
+func draw100(buf []byte, x, y int, c rgba) {
+	for row := 0; row < 11; row++ {
+		for col := 0; col < 3; col++ {
+			if (glyph1Slim[row]>>(2-col))&1 != 0 {
+				setPixel(buf, baseSize, x+col, y+row, c)
 			}
 		}
-		cx += 9
+		for col := 0; col < 5; col++ {
+			if (glyph0Slim[row]>>(4-col))&1 != 0 {
+				setPixel(buf, baseSize, x+4+col, y+row, c)
+				setPixel(buf, baseSize, x+10+col, y+row, c)
+			}
+		}
 	}
 }
 
-func fillRect(buf []byte, x, y, w, h int, c rgba) {
+func setPixel(buf []byte, stride, x, y int, c rgba) {
+	if x < 0 || x >= stride || y < 0 || y >= stride {
+		return
+	}
+	idx := (y*stride + x) * 4
+	buf[idx+0] = c.b
+	buf[idx+1] = c.g
+	buf[idx+2] = c.r
+	buf[idx+3] = c.a
+}
+
+func fillRect(buf []byte, stride, x, y, w, h int, c rgba) {
 	for dy := 0; dy < h; dy++ {
-		py := y + dy
-		if py < 0 || py >= iconSize {
-			continue
-		}
 		for dx := 0; dx < w; dx++ {
-			px := x + dx
-			if px < 0 || px >= iconSize {
-				continue
-			}
-			idx := (py*iconSize + px) * 4
-			buf[idx+0] = c.b
-			buf[idx+1] = c.g
-			buf[idx+2] = c.r
-			buf[idx+3] = c.a
+			setPixel(buf, stride, x+dx, y+dy, c)
 		}
 	}
+}
+
+func scaleNearest(src []byte, srcSize, dstSize int) []byte {
+	dst := make([]byte, dstSize*dstSize*4)
+	for dy := 0; dy < dstSize; dy++ {
+		sy := (dy * srcSize) / dstSize
+		for dx := 0; dx < dstSize; dx++ {
+			sx := (dx * srcSize) / dstSize
+			sIdx := (sy*srcSize + sx) * 4
+			dIdx := (dy*dstSize + dx) * 4
+			copy(dst[dIdx:dIdx+4], src[sIdx:sIdx+4])
+		}
+	}
+	return dst
 }
 
 func createIconFromBGRA(pixels []byte, w, h int) (uintptr, error) {
@@ -274,8 +454,9 @@ func createIconFromBGRA(pixels []byte, w, h int) (uintptr, error) {
 	dst := unsafe.Slice((*byte)(bitsPtr), len(pixels))
 	copy(dst, pixels)
 
-	// Empty 1-bit mask bitmap (alpha channel in hbmColor controls transparency).
-	maskBytes := make([]byte, (w*h)/8)
+	// 1-bit mask bitmap (stride must be padded to 16-bit WORD boundary per Win32 CreateBitmap).
+	rowBytes := ((w + 15) / 16) * 2
+	maskBytes := make([]byte, rowBytes*h)
 	hbmMask, _, err := procCreateBitmap.Call(
 		uintptr(w),
 		uintptr(h),
